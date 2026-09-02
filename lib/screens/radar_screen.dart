@@ -1,7 +1,57 @@
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
+import 'package:geolocator/geolocator.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import '../models/field_model.dart';
+import '../services/database_service.dart';
+import '../shared/theme.dart';
+
+/// One confirmed pest focus, as returned by get_regional_hotspots.
+class Hotspot {
+  final String pest;
+  final String cropType;
+  final int observerCount;
+  final int totalSpecimens;
+  final double latitude;
+  final double longitude;
+
+  const Hotspot({
+    required this.pest,
+    required this.cropType,
+    required this.observerCount,
+    required this.totalSpecimens,
+    required this.latitude,
+    required this.longitude,
+  });
+
+  factory Hotspot.fromJson(Map<String, dynamic> json) => Hotspot(
+        pest: json['pest_name'] as String? ?? 'Praga',
+        cropType: json['crop_type'] as String? ?? 'soja',
+        observerCount: (json['observer_count'] as num?)?.toInt() ?? 0,
+        totalSpecimens: (json['total_specimens'] as num?)?.toInt() ?? 0,
+        // The RPC now returns plain numerics instead of a geography column, so
+        // there is no GeoJSON unwrapping to do and nothing to mis-order.
+        latitude: (json['latitude'] as num?)?.toDouble() ?? 0,
+        longitude: (json['longitude'] as num?)?.toDouble() ?? 0,
+      );
+
+  String get category {
+    final p = pest.toLowerCase();
+    if (p.contains('lagarta')) return 'Lagartas';
+    if (p.contains('percevejo') || p.contains('bicudo')) return 'Percevejos';
+    return 'Outros';
+  }
+
+  Color get color => switch (category) {
+        'Lagartas' => AgroTheme.statusYellow,
+        'Percevejos' => AgroTheme.statusRed,
+        _ => AgroTheme.legendPurple,
+      };
+
+  /// Drives the heat circle radius: more confirmations, wider halo.
+  double get intensityRadiusMeters => 1500 + (observerCount.clamp(2, 12) * 400);
+}
 
 class RadarScreen extends StatefulWidget {
   const RadarScreen({super.key});
@@ -11,358 +61,125 @@ class RadarScreen extends StatefulWidget {
 }
 
 class _RadarScreenState extends State<RadarScreen> {
-  bool _isOfflineMode = true; // Default to offline high-fidelity vector map
-  bool _isLoading = false;
+  final _db = DatabaseService();
 
-  // Localized Hotspots simulating real data
-  List<Map<String, dynamic>> _hotspots = [
-    {
-      'pest': 'Lagarta-do-cartucho',
-      'count': 12,
-      'latitude': -16.324,
-      'longitude': -48.951,
-      'category': 'Lagartas',
-      'color': const Color(0xFFEF6C00), // Orange
-      'offset': const Offset(120, 160),
-    },
-    {
-      'pest': 'Percevejo-marrom',
-      'count': 8,
-      'latitude': -16.328,
-      'longitude': -48.955,
-      'category': 'Percevejos',
-      'color': const Color(0xFFC62828), // Red
-      'offset': const Offset(240, 220),
-    },
-    {
-      'pest': 'Cigarrinha-do-milho',
-      'count': 15,
-      'latitude': -16.320,
-      'longitude': -48.948,
-      'category': 'Outros',
-      'color': const Color(0xFF7B1FA2), // Purple
-      'offset': const Offset(180, 280),
-    },
-  ];
+  // Starts online. The vector fallback is for when the map cannot load, not the
+  // default view - previously the screen opened on mock data even with signal.
+  bool _offlineMode = false;
+  bool _loading = false;
+  String? _loadError;
+
+  List<Hotspot> _hotspots = const [];
+  List<FieldModel> _myFields = const [];
 
   @override
   void initState() {
     super.initState();
+    _myFields = _db.getFields();
     _fetchHotspots();
   }
 
   Future<void> _fetchHotspots() async {
     setState(() {
-      _isLoading = true;
+      _loading = true;
+      _loadError = null;
     });
 
     try {
-      final supabase = Supabase.instance.client;
-      final response = await supabase.rpc('get_regional_hotspots', params: {
-        'radius_meters': 5000.0,
-        'min_observers': 2,
-      });
+      final response = await Supabase.instance.client.rpc(
+        'get_regional_hotspots',
+        params: {
+          'radius_meters': 5000.0,
+          'min_observers': 2,
+          'window_days': 7,
+        },
+      );
 
-      if (response != null && response is List && response.isNotEmpty) {
-        final List<Map<String, dynamic>> loaded = [];
-        for (var item in response) {
-          final pestName = item['pest_name'] as String;
-          final count = (item['observer_count'] as num).toInt();
-          
-          // Determine coordinates from PostGIS geography point
-          double lat = -16.326;
-          double lon = -48.953;
-          if (item['location'] != null && item['location'] is Map) {
-            final coords = item['location']['coordinates'] as List?;
-            if (coords != null && coords.length >= 2) {
-              lon = (coords[0] as num).toDouble();
-              lat = (coords[1] as num).toDouble();
-            }
-          }
-
-          // Category mapping
-          String category = 'Outros';
-          Color color = const Color(0xFF7B1FA2);
-          if (pestName.toLowerCase().contains('lagarta')) {
-            category = 'Lagartas';
-            color = const Color(0xFFEF6C00);
-          } else if (pestName.toLowerCase().contains('percevejo')) {
-            category = 'Percevejos';
-            color = const Color(0xFFC62828);
-          }
-
-          // Distribute visually on screen
-          final rand = math.Random(pestName.hashCode);
-          loaded.add({
-            'pest': pestName,
-            'count': count,
-            'latitude': lat,
-            'longitude': lon,
-            'category': category,
-            'color': color,
-            'offset': Offset(100.0 + rand.nextDouble() * 200, 150.0 + rand.nextDouble() * 200),
-          });
-        }
-
-        setState(() {
-          _hotspots = loaded;
-        });
-      }
-    } catch (e) {
-      // Offline fallback: keep pre-configured mock focuses
-    } finally {
+      final list = (response as List?) ?? const [];
+      if (!mounted) return;
       setState(() {
-        _isLoading = false;
+        _hotspots = list
+            .map((e) => Hotspot.fromJson(Map<String, dynamic>.from(e)))
+            .toList();
+        _loading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _offlineMode = true;
+        _loadError = 'Sem conexão com o servidor. Mostrando o mapa simplificado.';
       });
     }
+  }
+
+  /// Straight-line distance from the producer's nearest field to the nearest
+  /// focus. This is the number that decides whether they act today.
+  ({Hotspot hotspot, double metres})? get _closestThreat {
+    if (_hotspots.isEmpty || _myFields.isEmpty) return null;
+
+    Hotspot? best;
+    var bestDistance = double.infinity;
+
+    for (final h in _hotspots) {
+      for (final f in _myFields) {
+        final d = Geolocator.distanceBetween(
+          f.latitude,
+          f.longitude,
+          h.latitude,
+          h.longitude,
+        );
+        if (d < bestDistance) {
+          bestDistance = d;
+          best = h;
+        }
+      }
+    }
+
+    if (best == null) return null;
+    return (hotspot: best, metres: bestDistance);
+  }
+
+  LatLng get _initialTarget {
+    if (_myFields.isNotEmpty) {
+      return LatLng(_myFields.first.latitude, _myFields.first.longitude);
+    }
+    if (_hotspots.isNotEmpty) {
+      return LatLng(_hotspots.first.latitude, _hotspots.first.longitude);
+    }
+    return const LatLng(-16.326, -48.953); // Anápolis region
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color(0xFFF4F6F5),
       appBar: AppBar(
-        backgroundColor: Colors.white,
-        elevation: 0,
-        centerTitle: true,
-        leading: IconButton(
-          icon: const Icon(Icons.arrow_back, color: Color(0xFF1B5E20)),
-          onPressed: () => Navigator.pop(context),
-        ),
-        title: const Text(
-          'Radar Regional MIP',
-          style: TextStyle(
-            color: Color(0xFF212121),
-            fontWeight: FontWeight.bold,
-            fontSize: 18,
-          ),
-        ),
+        title: const Text('Radar da região'),
         actions: [
           IconButton(
-            icon: const Icon(Icons.refresh, color: Color(0xFF1B5E20)),
-            onPressed: _isLoading ? null : _fetchHotspots,
+            icon: const Icon(Icons.refresh),
+            tooltip: 'Atualizar',
+            onPressed: _loading ? null : _fetchHotspots,
           ),
           IconButton(
-            icon: Icon(
-              _isOfflineMode ? Icons.signal_wifi_off : Icons.map_outlined,
-              color: const Color(0xFF1B5E20),
-            ),
-            onPressed: () {
-              setState(() {
-                _isOfflineMode = !_isOfflineMode;
-              });
-            },
+            icon: Icon(_offlineMode ? Icons.map_outlined : Icons.grid_view),
+            tooltip: _offlineMode ? 'Ver mapa' : 'Ver mapa simplificado',
+            onPressed: () => setState(() => _offlineMode = !_offlineMode),
           ),
         ],
       ),
       body: Stack(
         children: [
-          // 1. Map Content (Online GoogleMap or Custom Mock Painter)
           Positioned.fill(
-            child: _isOfflineMode
-                ? Container(
-                    color: const Color(0xFFE5E9F0),
-                    child: ClipRect(
-                      child: InteractiveViewer(
-                        maxScale: 3.0,
-                        child: Stack(
-                          children: [
-                            Positioned.fill(
-                              child: CustomPaint(
-                                painter: MockMapPainter(),
-                              ),
-                            ),
-                            // Overlay Hotspots
-                            ..._hotspots.map((h) {
-                              final offset = h['offset'] as Offset;
-                              final color = h['color'] as Color;
-                              return Positioned(
-                                left: offset.dx - 20,
-                                top: offset.dy - 20,
-                                child: GestureDetector(
-                                  onTap: () {
-                                    showDialog(
-                                      context: context,
-                                      builder: (context) => AlertDialog(
-                                        title: Text(h['pest']),
-                                        content: Text(
-                                          'Categoria: ${h['category']}\n'
-                                          'Focos Identificados: ${h['count']}\n'
-                                          'Coordenadas: ${h['latitude'].toStringAsFixed(4)}, ${h['longitude'].toStringAsFixed(4)}',
-                                        ),
-                                        actions: [
-                                          TextButton(
-                                            onPressed: () => Navigator.pop(context),
-                                            child: const Text('Fechar'),
-                                          ),
-                                        ],
-                                      ),
-                                    );
-                                  },
-                                  child: Stack(
-                                    alignment: Alignment.center,
-                                    children: [
-                                      // Outer Pulse
-                                      Container(
-                                        width: 40,
-                                        height: 40,
-                                        decoration: BoxDecoration(
-                                          color: color.withOpacity(0.25),
-                                          shape: BoxShape.circle,
-                                        ),
-                                      ),
-                                      // Inner Glow
-                                      Container(
-                                        width: 24,
-                                        height: 24,
-                                        decoration: BoxDecoration(
-                                          color: color.withOpacity(0.5),
-                                          shape: BoxShape.circle,
-                                        ),
-                                      ),
-                                      // Solid center dot
-                                      Container(
-                                        width: 10,
-                                        height: 10,
-                                        decoration: BoxDecoration(
-                                          color: color,
-                                          shape: BoxShape.circle,
-                                          border: Border.all(color: Colors.white, width: 1.5),
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                ),
-                              );
-                            }),
-                          ],
-                        ),
-                      ),
-                    ),
-                  )
-                : GoogleMap(
-                    initialCameraPosition: const CameraPosition(
-                      target: LatLng(-16.326, -48.953), // Nerópolis / Anápolis region
-                      zoom: 12,
-                    ),
-                    myLocationEnabled: true,
-                    zoomControlsEnabled: false,
-                    markers: _hotspots.map((h) {
-                      return Marker(
-                        markerId: MarkerId(h['pest'] + h['latitude'].toString()),
-                        position: LatLng(h['latitude'] as double, h['longitude'] as double),
-                        infoWindow: InfoWindow(
-                          title: h['pest'],
-                          snippet: 'Grupo: ${h['category']} - Focos: ${h['count']}',
-                        ),
-                      );
-                    }).toSet(),
-                  ),
+            child: _offlineMode ? _simplifiedMap() : _googleMap(),
           ),
-
-          // 2. Green Informational Box (Top Banner)
-          Positioned(
-            top: 16,
-            left: 16,
-            right: 16,
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-              decoration: BoxDecoration(
-                color: const Color(0xFFE8F5E9), // Mint green
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: const Color(0xFFC8E6C9), width: 1),
-              ),
-              child: Row(
-                children: const [
-                  Icon(
-                    Icons.security,
-                    color: Color(0xFF2E7D32),
-                    size: 20,
-                  ),
-                  SizedBox(width: 12),
-                  Expanded(
-                    child: Text(
-                      'VISÃO ANÔNIMA: Focos agrupados por grade territorial para proteção e privacidade do produtor.',
-                      style: TextStyle(
-                        color: Color(0xFF1B5E20),
-                        fontSize: 12,
-                        fontWeight: FontWeight.w500,
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-
-          // 3. Bottom Legend Card Sheet
-          Positioned(
-            left: 0,
-            right: 0,
-            bottom: 0,
-            child: Container(
-              decoration: const BoxDecoration(
-                color: Colors.white,
-                borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-                boxShadow: [
-                  BoxShadow(
-                    color: Colors.black12,
-                    blurRadius: 10,
-                    offset: Offset(0, -2),
-                  ),
-                ],
-              ),
-              padding: const EdgeInsets.all(20),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  // Title
-                  const Text(
-                    'LEGENDA DE RISCO REGIONAL',
-                    style: TextStyle(
-                      fontSize: 12,
-                      fontWeight: FontWeight.bold,
-                      color: Color(0xFF37474F),
-                      letterSpacing: 0.8,
-                    ),
-                  ),
-                  const SizedBox(height: 16),
-                  
-                  // Row of bullets
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      _buildLegendItem(const Color(0xFFEF6C00), 'Lagartas'),
-                      _buildLegendItem(const Color(0xFFC62828), 'Percevejos'),
-                      _buildLegendItem(const Color(0xFF7B1FA2), 'Outros'),
-                    ],
-                  ),
-                  const SizedBox(height: 16),
-                  
-                  // Footnote
-                  const Center(
-                    child: Text(
-                      '* Toque nos círculos ou marcadores para ver a intensidade e número de focos',
-                      style: TextStyle(
-                        fontSize: 10,
-                        fontStyle: FontStyle.italic,
-                        color: Color(0xFF757575),
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-          
-          if (_isLoading)
-            Positioned.fill(
-              child: Container(
-                color: Colors.white24,
-                child: const Center(
-                  child: CircularProgressIndicator(color: Color(0xFF1B5E20)),
-                ),
+          Positioned(top: 12, left: 12, right: 12, child: _topBanner()),
+          Positioned(left: 0, right: 0, bottom: 0, child: _legendSheet()),
+          if (_loading)
+            const Positioned.fill(
+              child: ColoredBox(
+                color: Color(0x33FFFFFF),
+                child: Center(child: CircularProgressIndicator()),
               ),
             ),
         ],
@@ -370,24 +187,271 @@ class _RadarScreenState extends State<RadarScreen> {
     );
   }
 
-  Widget _buildLegendItem(Color color, String label) {
-    return Row(
-      children: [
-        Container(
-          width: 12,
-          height: 12,
-          decoration: BoxDecoration(
-            color: color,
-            shape: BoxShape.circle,
+  Widget _googleMap() {
+    return GoogleMap(
+      initialCameraPosition: CameraPosition(target: _initialTarget, zoom: 11),
+      myLocationEnabled: true,
+      myLocationButtonEnabled: true,
+      zoomControlsEnabled: false,
+      // Weighted circles instead of fixed-size pins: the halo grows with the
+      // number of independent confirmations, which is what "heat" means here.
+      circles: _hotspots
+          .map((h) => Circle(
+                circleId: CircleId('heat_${h.pest}_${h.latitude}_${h.longitude}'),
+                center: LatLng(h.latitude, h.longitude),
+                radius: h.intensityRadiusMeters,
+                fillColor: h.color.withValues(alpha: 0.18),
+                strokeColor: h.color.withValues(alpha: 0.55),
+                strokeWidth: 2,
+              ))
+          .toSet(),
+      markers: {
+        for (final h in _hotspots)
+          Marker(
+            markerId: MarkerId('${h.pest}_${h.latitude}_${h.longitude}'),
+            position: LatLng(h.latitude, h.longitude),
+            infoWindow: InfoWindow(
+              title: h.pest,
+              snippet:
+                  '${h.observerCount} produtores confirmaram · ${h.totalSpecimens} insetos',
+            ),
+          ),
+        // The producer's own fields, so the focus has a reference point.
+        for (final f in _myFields)
+          Marker(
+            markerId: MarkerId('field_${f.id}'),
+            position: LatLng(f.latitude, f.longitude),
+            icon: BitmapDescriptor.defaultMarkerWithHue(
+              BitmapDescriptor.hueGreen,
+            ),
+            infoWindow: InfoWindow(
+              title: f.name,
+              snippet: 'Seu talhão · ${f.cropType}',
+            ),
+          ),
+      },
+    );
+  }
+
+  Widget _simplifiedMap() {
+    return Container(
+      color: const Color(0xFFE5E9F0),
+      child: ClipRect(
+        child: InteractiveViewer(
+          maxScale: 3.0,
+          child: Stack(
+            children: [
+              const Positioned.fill(child: CustomPaint(painter: MockMapPainter())),
+              ..._hotspots.asMap().entries.map((entry) {
+                final h = entry.value;
+                // Deterministic placement seeded by the focus identity, so the
+                // same focus stays put between refreshes. It is a schematic, not
+                // a projection - the banner says so.
+                final rand = math.Random(
+                  '${h.pest}${h.latitude.toStringAsFixed(3)}'.hashCode,
+                );
+                final dx = 60 + rand.nextDouble() * 220;
+                final dy = 140 + rand.nextDouble() * 240;
+                final size = 32.0 + h.observerCount.clamp(2, 10) * 4;
+
+                return Positioned(
+                  left: dx,
+                  top: dy,
+                  child: GestureDetector(
+                    onTap: () => _showHotspotDetail(h),
+                    child: Stack(
+                      alignment: Alignment.center,
+                      children: [
+                        Container(
+                          width: size,
+                          height: size,
+                          decoration: BoxDecoration(
+                            color: h.color.withValues(alpha: 0.22),
+                            shape: BoxShape.circle,
+                          ),
+                        ),
+                        Container(
+                          width: 14,
+                          height: 14,
+                          decoration: BoxDecoration(
+                            color: h.color,
+                            shape: BoxShape.circle,
+                            border: Border.all(color: Colors.white, width: 2),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                );
+              }),
+            ],
           ),
         ),
-        const SizedBox(width: 8),
+      ),
+    );
+  }
+
+  void _showHotspotDetail(Hotspot h) {
+    showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(h.pest),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('Confirmado por ${h.observerCount} produtores diferentes.'),
+            const SizedBox(height: 6),
+            Text('Total contado na região: ${h.totalSpecimens}.'),
+            const SizedBox(height: 6),
+            Text('Cultura afetada: ${h.cropType}.'),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Fechar'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Leads with the actionable number when there is one, and only falls back to
+  /// the privacy note when there is nothing near the producer.
+  Widget _topBanner() {
+    final threat = _closestThreat;
+
+    if (_loadError != null) {
+      return _banner(
+        icon: Icons.cloud_off,
+        text: _loadError!,
+        tint: AgroTheme.statusYellowTint,
+        strong: AgroTheme.statusYellow,
+      );
+    }
+
+    if (threat != null) {
+      final km = (threat.metres / 1000).toStringAsFixed(1);
+      final close = threat.metres <= 20000;
+      return _banner(
+        icon: close ? Icons.warning_amber_rounded : Icons.travel_explore,
+        text: 'Foco de ${threat.hotspot.pest} a $km km do seu talhão mais próximo.',
+        tint: close ? AgroTheme.statusRedTint : AgroTheme.statusGreenTint,
+        strong: close ? AgroTheme.statusRed : AgroTheme.statusGreen,
+      );
+    }
+
+    return _banner(
+      icon: Icons.shield_outlined,
+      text: 'Focos agrupados por área. Ninguém vê a localização exata do seu talhão.',
+      tint: AgroTheme.statusGreenTint,
+      strong: AgroTheme.primaryDark,
+    );
+  }
+
+  Widget _banner({
+    required IconData icon,
+    required String text,
+    required Color tint,
+    required Color strong,
+  }) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      decoration: BoxDecoration(
+        color: tint,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: strong.withValues(alpha: 0.25)),
+      ),
+      child: Row(
+        children: [
+          Icon(icon, color: strong, size: 24),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Text(
+              text,
+              style: TextStyle(
+                color: strong,
+                fontSize: 14,
+                fontWeight: FontWeight.w600,
+                height: 1.3,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _legendSheet() {
+    return Container(
+      decoration: const BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+        boxShadow: [
+          BoxShadow(color: Colors.black12, blurRadius: 12, offset: Offset(0, -2)),
+        ],
+      ),
+      padding: const EdgeInsets.fromLTRB(20, 16, 20, 20),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            _hotspots.isEmpty
+                ? 'Nenhum foco confirmado nos últimos 7 dias'
+                : '${_hotspots.length} foco(s) confirmado(s) nos últimos 7 dias',
+            style: const TextStyle(
+              fontSize: 16,
+              fontWeight: FontWeight.bold,
+              color: AgroTheme.textDark,
+            ),
+          ),
+          const SizedBox(height: 14),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: const [
+              _LegendItem(color: AgroTheme.statusYellow, label: 'Lagartas'),
+              _LegendItem(color: AgroTheme.statusRed, label: 'Percevejos'),
+              _LegendItem(color: AgroTheme.legendPurple, label: 'Outros'),
+              _LegendItem(color: AgroTheme.primary, label: 'Seus talhões'),
+            ],
+          ),
+          const SizedBox(height: 12),
+          const Text(
+            'O círculo cresce conforme mais produtores confirmam a mesma praga. '
+            'Toque para ver os detalhes.',
+            style: TextStyle(fontSize: 13, color: AgroTheme.textGray, height: 1.3),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _LegendItem extends StatelessWidget {
+  final Color color;
+  final String label;
+
+  const _LegendItem({required this.color, required this.label});
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          width: 14,
+          height: 14,
+          decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+        ),
+        const SizedBox(width: 6),
         Text(
           label,
           style: const TextStyle(
             fontSize: 14,
-            fontWeight: FontWeight.bold,
-            color: Color(0xFF212121),
+            fontWeight: FontWeight.w600,
+            color: AgroTheme.textDark,
           ),
         ),
       ],
@@ -395,119 +459,57 @@ class _RadarScreenState extends State<RadarScreen> {
   }
 }
 
-// Custom Painter to draw a clean, light-colored map background of regional roads and fields
+/// Schematic road/field background for the fallback view. Drawn rather than
+/// tiled so it works with no network and no Maps key.
 class MockMapPainter extends CustomPainter {
+  const MockMapPainter();
+
   @override
   void paint(Canvas canvas, Size size) {
-    // Background green agricultural lands and main routes
-    final paintFields = Paint()
-      ..color = const Color(0xFFDFEAD5)
-      ..style = PaintingStyle.fill;
-    
-    // Draw some green zones representing farms
-    canvas.drawRect(Rect.fromLTWH(0, 0, size.width * 0.4, size.height * 0.3), paintFields);
-    canvas.drawRect(Rect.fromLTWH(size.width * 0.6, size.height * 0.1, size.width * 0.35, size.height * 0.45), paintFields);
-    canvas.drawRect(Rect.fromLTWH(size.width * 0.1, size.height * 0.6, size.width * 0.5, size.height * 0.35), paintFields);
-
-    // River
-    final paintRiver = Paint()
-      ..color = const Color(0xFFB3E5FC)
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 6.0
+    final field = Paint()..color = const Color(0xFFDCE6DA);
+    final road = Paint()
+      ..color = const Color(0xFFFFFFFF)
+      ..strokeWidth = 8
       ..strokeCap = StrokeCap.round;
+    final track = Paint()
+      ..color = const Color(0xFFC9D3C7)
+      ..strokeWidth = 3;
 
-    final pathRiver = Path();
-    pathRiver.moveTo(0, size.height * 0.4);
-    pathRiver.quadraticBezierTo(
-      size.width * 0.3, size.height * 0.35,
-      size.width * 0.6, size.height * 0.5,
+    canvas.drawRect(Offset.zero & size, Paint()..color = const Color(0xFFE5E9F0));
+
+    // Blocks of cropland.
+    final rand = math.Random(7);
+    for (var i = 0; i < 14; i++) {
+      final left = rand.nextDouble() * size.width;
+      final top = rand.nextDouble() * size.height;
+      final w = 60 + rand.nextDouble() * 120;
+      final h = 50 + rand.nextDouble() * 90;
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(
+          Rect.fromLTWH(left, top, w, h),
+          const Radius.circular(6),
+        ),
+        field,
+      );
+    }
+
+    // Field tracks.
+    for (var i = 0; i < 10; i++) {
+      final y = size.height * (i / 10);
+      canvas.drawLine(Offset(0, y), Offset(size.width, y), track);
+    }
+
+    // Two main roads.
+    canvas.drawLine(
+      Offset(0, size.height * 0.62),
+      Offset(size.width, size.height * 0.38),
+      road,
     );
-    pathRiver.quadraticBezierTo(
-      size.width * 0.8, size.height * 0.6,
-      size.width, size.height * 0.55,
+    canvas.drawLine(
+      Offset(size.width * 0.33, 0),
+      Offset(size.width * 0.52, size.height),
+      road,
     );
-    canvas.drawPath(pathRiver, paintRiver);
-
-    // Highways / Roads (GO-080, GO-222, GO-466)
-    final paintRoadBorder = Paint()
-      ..color = const Color(0xFFB0BEC5)
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 5.0
-      ..strokeCap = StrokeCap.round;
-
-    final paintRoadCenter = Paint()
-      ..color = const Color(0xFFFFD54F) // Yellow Highway fill
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 3.0
-      ..strokeCap = StrokeCap.round;
-
-    // GO-080
-    final pathGO080 = Path();
-    pathGO080.moveTo(size.width * 0.1, 0);
-    pathGO080.lineTo(size.width * 0.5, size.height * 0.5);
-    pathGO080.lineTo(size.width * 0.7, size.height);
-    canvas.drawPath(pathGO080, paintRoadBorder);
-    canvas.drawPath(pathGO080, paintRoadCenter);
-
-    // GO-222
-    final pathGO222 = Path();
-    pathGO222.moveTo(0, size.height * 0.5);
-    pathGO222.lineTo(size.width * 0.5, size.height * 0.5);
-    pathGO222.lineTo(size.width, size.height * 0.6);
-    canvas.drawPath(pathGO222, paintRoadBorder);
-    canvas.drawPath(pathGO222, paintRoadCenter);
-
-    // GO-466
-    final pathGO466 = Path();
-    pathGO466.moveTo(size.width * 0.5, size.height * 0.5);
-    pathGO466.lineTo(size.width * 0.45, size.height);
-    canvas.drawPath(pathGO466, paintRoadBorder);
-    canvas.drawPath(pathGO466, paintRoadCenter);
-
-    // Draw City Label: Nerópolis
-    final textPainter = TextPainter(
-      textDirection: TextDirection.ltr,
-    );
-
-    // Nerópolis text
-    textPainter.text = const TextSpan(
-      text: 'Nerópolis',
-      style: TextStyle(
-        color: Color(0xFF37474F),
-        fontSize: 14,
-        fontWeight: FontWeight.bold,
-        backgroundColor: Colors.white70,
-      ),
-    );
-    textPainter.layout();
-    textPainter.paint(canvas, Offset(size.width * 0.45 - 20, size.height * 0.5 - 24));
-
-    // Highway labels
-    const textStyleLabel = TextStyle(
-      color: Colors.white,
-      fontSize: 8,
-      fontWeight: FontWeight.bold,
-    );
-
-    final labelPaint = Paint()..color = const Color(0xFFC62828);
-
-    // GO-080 label box
-    canvas.drawRRect(RRect.fromRectAndRadius(Rect.fromLTWH(size.width * 0.2, 80, 40, 14), const Radius.circular(3)), labelPaint);
-    textPainter.text = const TextSpan(text: 'GO-080', style: textStyleLabel);
-    textPainter.layout();
-    textPainter.paint(canvas, Offset(size.width * 0.2 + 4, 81));
-
-    // GO-222 label box
-    canvas.drawRRect(RRect.fromRectAndRadius(Rect.fromLTWH(60, size.height * 0.5 - 24, 40, 14), const Radius.circular(3)), labelPaint);
-    textPainter.text = const TextSpan(text: 'GO-222', style: textStyleLabel);
-    textPainter.layout();
-    textPainter.paint(canvas, Offset(64, size.height * 0.5 - 23));
-
-    // GO-466 label box
-    canvas.drawRRect(RRect.fromRectAndRadius(Rect.fromLTWH(size.width * 0.45 - 10, size.height * 0.75, 40, 14), const Radius.circular(3)), labelPaint);
-    textPainter.text = const TextSpan(text: 'GO-466', style: textStyleLabel);
-    textPainter.layout();
-    textPainter.paint(canvas, Offset(size.width * 0.45 - 6, size.height * 0.75 + 1));
   }
 
   @override

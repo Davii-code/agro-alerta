@@ -50,3 +50,5 @@ app.*.map.json
 .agent/
 __pycache__/
 *.pyc
+# ...but the template carries no secrets and is meant to be committed
+!.env.example

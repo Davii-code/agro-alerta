@@ -2,64 +2,69 @@ import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'services/database_service.dart';
 import 'services/sync_service.dart';
+import 'services/mip_service.dart';
 import 'shared/theme.dart';
 import 'screens/login_screen.dart';
 import 'screens/home_screen.dart';
 import 'screens/new_sampling_screen.dart';
 import 'screens/radar_screen.dart';
+import 'screens/history_screen.dart';
+import 'screens/onboarding_screen.dart';
 
-// Environment variables can be injected at build time, e.g.:
-// --dart-define=SUPABASE_URL=... --dart-define=SUPABASE_ANON_KEY=...
-const String supabaseUrl = String.fromEnvironment('SUPABASE_URL', defaultValue: 'https://lavidarlbbixpktbdybl.supabase.co');
-const String supabaseAnonKey = String.fromEnvironment('SUPABASE_ANON_KEY', defaultValue: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxhdmlkYXJsYmJpeHBrdGJkeWJsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzg1OTI3MjgsImV4cCI6MjA5NDE2ODcyOH0.-Gd0C4hwJyhVrPX8lc9RenUe1Um7u4YtOb7cym2lipA');
+// Credentials are injected at build time and never committed:
+//   flutter run --dart-define=SUPABASE_URL=... --dart-define=SUPABASE_ANON_KEY=...
+// See README.md. With no values the app boots in offline demo mode.
+const String supabaseUrl = String.fromEnvironment('SUPABASE_URL');
+const String supabaseAnonKey = String.fromEnvironment('SUPABASE_ANON_KEY');
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // Initialize Database Service (Hive storage for offline-first)
-  try {
-    await DatabaseService().init();
-    print("Database Service: Hive initialized successfully.");
-  } catch (e) {
-    print("Database Service: Failed to initialize Hive: $e");
-  }
+  // Hive first: every write in the app lands here before it ever touches the
+  // network, so storage must be ready even if everything else fails.
+  await DatabaseService().init();
 
-  // Optional: Initialize Supabase connection
   if (supabaseUrl.isNotEmpty && supabaseAnonKey.isNotEmpty) {
     try {
-      await Supabase.initialize(
-        url: supabaseUrl,
-        anonKey: supabaseAnonKey,
-      );
-      print("Supabase: Connected successfully.");
+      await Supabase.initialize(url: supabaseUrl, anonKey: supabaseAnonKey);
+      debugPrint('Supabase: conectado.');
     } catch (e) {
-      print("Supabase: Initialization failed: $e");
+      debugPrint('Supabase: falha ao inicializar ($e). Seguindo offline.');
     }
   } else {
-    print("Supabase: Running in Offline Simulation Mode (No URL/Key provided).");
+    debugPrint('Supabase: sem credenciais de build. Modo offline.');
   }
 
-  // Start Background Sync Service
-  SyncService().startPeriodicSync();
+  // Refresh the MIP economics cache once at boot; it falls back to the last
+  // cached copy, then to bundled constants, so it never blocks startup.
+  await MipService().refresh();
 
-  runApp(const AgroAlertaApp());
+  SyncService().start();
+
+  final seenOnboarding = DatabaseService().hasSeenOnboarding();
+
+  runApp(AgroAlertaApp(seenOnboarding: seenOnboarding));
 }
 
 class AgroAlertaApp extends StatelessWidget {
-  const AgroAlertaApp({super.key});
+  final bool seenOnboarding;
+
+  const AgroAlertaApp({super.key, this.seenOnboarding = true});
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'AgroAlerta',
+      title: 'Agro Alerta GO',
       theme: AgroTheme.themeData,
       debugShowCheckedModeBanner: false,
-      initialRoute: '/login',
+      initialRoute: seenOnboarding ? '/login' : '/onboarding',
       routes: {
+        '/onboarding': (context) => const OnboardingScreen(),
         '/login': (context) => const LoginScreen(),
         '/home': (context) => const HomeScreen(),
         '/new-sampling': (context) => const NewSamplingScreen(),
         '/radar': (context) => const RadarScreen(),
+        '/history': (context) => const HistoryScreen(),
       },
     );
   }

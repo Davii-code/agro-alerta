@@ -1,8 +1,26 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Required for Supabase sync and Google Maps tiles -->
+    <uses-permission android:name="android.permission.INTERNET"/>
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+
+    <!-- Required by geolocator to stamp samplings with real GPS coordinates (RF01) -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
+
+    <!-- GPS hardware is preferred but not mandatory: the app degrades to the field centroid -->
+    <uses-feature android:name="android.hardware.location.gps" android:required="false"/>
+
     <application
-        android:label="agro_alerta"
+        android:label="Agro Alerta GO"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
+
+        <!-- Injected from android/local.properties via manifestPlaceholders (see build.gradle.kts).
+             Never commit the real key: local.properties is git-ignored. -->
+        <meta-data
+            android:name="com.google.android.geo.API_KEY"
+            android:value="${googleMapsApiKey}"/>
+
         <activity
             android:name=".MainActivity"
             android:exported="true"

@@ -34,6 +34,35 @@ class _LoginScreenState extends State<LoginScreen> {
     super.dispose();
   }
 
+  /// Backs the "Esqueci minha senha" link, which was previously a button with
+  /// an empty onPressed - it looked functional and did nothing.
+  Future<void> _handleForgotPassword() async {
+    final email = _emailController.text.trim();
+    if (email.isEmpty) {
+      setState(() {
+        _errorMessage = 'Digite seu e-mail acima para receber o link.';
+        _successMessage = null;
+      });
+      return;
+    }
+
+    setState(() {
+      _isLoading = true;
+      _errorMessage = null;
+      _successMessage = null;
+    });
+
+    final error = await AuthService().requestPasswordReset(email);
+
+    if (!mounted) return;
+    setState(() {
+      _isLoading = false;
+      _errorMessage = error;
+      _successMessage =
+          error == null ? 'Enviamos um link de recuperação para $email.' : null;
+    });
+  }
+
   Future<void> _handleSubmit() async {
     if (!_formKey.currentState!.validate()) return;
 
@@ -43,56 +72,48 @@ class _LoginScreenState extends State<LoginScreen> {
       _successMessage = null;
     });
 
-    try {
-      if (_isSignUp) {
-        final user = await AuthService().signUp(
-          email: _emailController.text.trim(),
-          password: _passwordController.text.trim(),
-          name: _nameController.text.trim(),
-          phone: _phoneController.text.trim(),
-          role: _selectedRole,
-        );
+    // AuthService now returns an AuthResult with a Portuguese message instead of
+    // throwing AuthException, so a wrong password and a dead connection can be
+    // told apart and neither reaches the producer as an English SDK string.
+    if (_isSignUp) {
+      final result = await AuthService().signUp(
+        email: _emailController.text.trim(),
+        password: _passwordController.text.trim(),
+        name: _nameController.text.trim(),
+        phone: _phoneController.text.trim(),
+        role: _selectedRole,
+      );
 
-        if (user != null) {
-          setState(() {
-            _successMessage = 'Conta criada com sucesso! Você já pode entrar.';
-            _isSignUp = false;
-            _passwordController.clear();
-          });
-        } else {
-          setState(() {
-            _errorMessage = 'Falha ao criar conta. Tente novamente.';
-          });
-        }
-      } else {
-        final user = await AuthService().signIn(
-          email: _emailController.text.trim(),
-          password: _passwordController.text.trim(),
-        );
-
-        if (user != null) {
-          if (mounted) {
-            Navigator.pushReplacementNamed(context, '/home');
-          }
-        } else {
-          setState(() {
-            _errorMessage = 'Falha ao autenticar. Verifique suas credenciais.';
-          });
-        }
-      }
-    } catch (e) {
+      if (!mounted) return;
       setState(() {
-        _errorMessage = e.toString().replaceFirst('Exception: ', '');
+        _isLoading = false;
+        if (result.isSuccess) {
+          _successMessage = 'Conta criada! Agora entre com seu e-mail e senha.';
+          _isSignUp = false;
+          _passwordController.clear();
+        } else {
+          _errorMessage = result.errorMessage;
+        }
       });
-    } finally {
-      if (mounted) {
-        setState(() {
-          _isLoading = false;
-        });
-      }
+      return;
     }
-  }
 
+    final result = await AuthService().signIn(
+      email: _emailController.text.trim(),
+      password: _passwordController.text.trim(),
+    );
+
+    if (!mounted) return;
+    if (result.isSuccess) {
+      Navigator.pushReplacementNamed(context, '/home');
+      return;
+    }
+
+    setState(() {
+      _isLoading = false;
+      _errorMessage = result.errorMessage;
+    });
+  }
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -155,12 +176,12 @@ class _LoginScreenState extends State<LoginScreen> {
                     ),
                     child: Row(
                       children: [
-                        const Icon(Icons.error_outline, color: AgroTheme.statusRed, size: 18),
+                        const Icon(Icons.error_outline, color: AgroTheme.statusRed, size: 22),
                         const SizedBox(width: 8),
                         Expanded(
                           child: Text(
                             _errorMessage!,
-                            style: const TextStyle(color: AgroTheme.statusRed, fontSize: 13),
+                            style: const TextStyle(color: AgroTheme.statusRed, fontSize: 15, height: 1.35),
                           ),
                         ),
                       ],
@@ -178,12 +199,12 @@ class _LoginScreenState extends State<LoginScreen> {
                     ),
                     child: Row(
                       children: [
-                        const Icon(Icons.check_circle_outline, color: AgroTheme.statusGreen, size: 18),
+                        const Icon(Icons.check_circle_outline, color: AgroTheme.statusGreen, size: 22),
                         const SizedBox(width: 8),
                         Expanded(
                           child: Text(
                             _successMessage!,
-                            style: const TextStyle(color: AgroTheme.statusGreen, fontSize: 13, fontWeight: FontWeight.bold),
+                            style: const TextStyle(color: AgroTheme.statusGreen, fontSize: 15, fontWeight: FontWeight.bold, height: 1.35),
                           ),
                         ),
                       ],
@@ -196,14 +217,14 @@ class _LoginScreenState extends State<LoginScreen> {
                 if (_isSignUp) ...[
                   const Text(
                     'NOME COMPLETO',
-                    style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: AgroTheme.textGray, letterSpacing: 0.5),
+                    style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: AgroTheme.textGray, letterSpacing: 0.5),
                   ),
                   const SizedBox(height: 8),
                   TextFormField(
                     controller: _nameController,
                     decoration: const InputDecoration(
                       hintText: 'Digite seu nome completo',
-                      prefixIcon: Icon(Icons.person_outline, size: 20),
+                      prefixIcon: Icon(Icons.person_outline, size: 22),
                     ),
                     validator: (value) {
                       if (value == null || value.isEmpty) {
@@ -216,7 +237,7 @@ class _LoginScreenState extends State<LoginScreen> {
                   
                   const Text(
                     'TELEFONE WHATSAPP',
-                    style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: AgroTheme.textGray, letterSpacing: 0.5),
+                    style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: AgroTheme.textGray, letterSpacing: 0.5),
                   ),
                   const SizedBox(height: 8),
                   TextFormField(
@@ -224,7 +245,7 @@ class _LoginScreenState extends State<LoginScreen> {
                     keyboardType: TextInputType.phone,
                     decoration: const InputDecoration(
                       hintText: '(62) 99999-9999',
-                      prefixIcon: Icon(Icons.phone_outlined, size: 20),
+                      prefixIcon: Icon(Icons.phone_outlined, size: 22),
                     ),
                     validator: (value) {
                       if (value == null || value.isEmpty) {
@@ -237,18 +258,18 @@ class _LoginScreenState extends State<LoginScreen> {
 
                   const Text(
                     'TIPO DE USUÁRIO',
-                    style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: AgroTheme.textGray, letterSpacing: 0.5),
+                    style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: AgroTheme.textGray, letterSpacing: 0.5),
                   ),
                   const SizedBox(height: 8),
                   DropdownButtonFormField<String>(
-                    value: _selectedRole,
+                    initialValue: _selectedRole,
                     items: const [
                       DropdownMenuItem(value: 'producer', child: Text('Produtor Rural')),
                       DropdownMenuItem(value: 'extensionist', child: Text('Extensionista / Técnico')),
                     ],
                     onChanged: (val) => setState(() => _selectedRole = val!),
                     decoration: const InputDecoration(
-                      prefixIcon: Icon(Icons.assignment_ind_outlined, size: 20),
+                      prefixIcon: Icon(Icons.assignment_ind_outlined, size: 22),
                     ),
                   ),
                   const SizedBox(height: 20),
@@ -257,7 +278,7 @@ class _LoginScreenState extends State<LoginScreen> {
                 // Shared Fields
                 const Text(
                   'E-MAIL',
-                  style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: AgroTheme.textGray, letterSpacing: 0.5),
+                  style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: AgroTheme.textGray, letterSpacing: 0.5),
                 ),
                 const SizedBox(height: 8),
                 TextFormField(
@@ -265,7 +286,7 @@ class _LoginScreenState extends State<LoginScreen> {
                   keyboardType: TextInputType.emailAddress,
                   decoration: const InputDecoration(
                     hintText: 'nome@exemplo.com',
-                    prefixIcon: Icon(Icons.alternate_email, size: 20),
+                    prefixIcon: Icon(Icons.alternate_email, size: 22),
                   ),
                   validator: (value) {
                     if (value == null || value.isEmpty) {
@@ -279,7 +300,7 @@ class _LoginScreenState extends State<LoginScreen> {
                 
                 const Text(
                   'SENHA',
-                  style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: AgroTheme.textGray, letterSpacing: 0.5),
+                  style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: AgroTheme.textGray, letterSpacing: 0.5),
                 ),
                 const SizedBox(height: 8),
                 TextFormField(
@@ -287,7 +308,7 @@ class _LoginScreenState extends State<LoginScreen> {
                   obscureText: _obscurePassword,
                   decoration: InputDecoration(
                     hintText: '.........',
-                    prefixIcon: const Icon(Icons.lock_outline, size: 20),
+                    prefixIcon: const Icon(Icons.lock_outline, size: 22),
                     suffixIcon: IconButton(
                       icon: Icon(
                         _obscurePassword ? Icons.visibility_outlined : Icons.visibility_off_outlined,
@@ -304,6 +325,10 @@ class _LoginScreenState extends State<LoginScreen> {
                     if (value == null || value.isEmpty) {
                       return 'Insira sua senha';
                     }
+                    // Stated up front rather than bounced back by the server.
+                    if (_isSignUp && value.length < 6) {
+                      return 'A senha precisa ter pelo menos 6 caracteres';
+                    }
                     return null;
                   },
                 ),
@@ -313,10 +338,10 @@ class _LoginScreenState extends State<LoginScreen> {
                   Align(
                     alignment: Alignment.centerRight,
                     child: TextButton(
-                      onPressed: () {},
+                      onPressed: _isLoading ? null : _handleForgotPassword,
                       child: const Text(
-                        'Esqueci minha senha?',
-                        style: TextStyle(color: AgroTheme.primary, fontWeight: FontWeight.w600, fontSize: 13),
+                        'Esqueci minha senha',
+                        style: TextStyle(color: AgroTheme.primaryDark, fontWeight: FontWeight.w600, fontSize: 15),
                       ),
                     ),
                   ),

@@ -1,6 +1,7 @@
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
+import requests
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
@@ -9,6 +10,11 @@ load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://your-project.supabase.co")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "your-anon-or-service-key")
+
+# WhatsApp delivery is delegated to the Edge Functions so there is exactly one
+# code path that talks to a provider. Without these the pipeline prints instead.
+EDGE_FUNCTION_URL = os.getenv("SUPABASE_FUNCTIONS_URL", "").rstrip("/")
+CRON_SECRET = os.getenv("CRON_SECRET", "")
 
 # Initialize Supabase Client
 try:
@@ -20,23 +26,35 @@ except Exception as e:
 # Default local fallback parameters for Crops & Pests (MIP constants)
 # C = Cost of control (R$/ha), K = Control efficiency (0.0 to 1.0), I = Injury coefficient
 MIP_FALLBACK_PARAMETERS = {
+    # Pest keys match the picker in lib/screens/new_sampling_screen.dart exactly;
+    # a mismatch here silently falls through to the "*" wildcard.
+    # "*" is the per-crop default, mirroring mip_parameters in migration 03.
     "soja": {
-        "Lagarta da Soja": {"C": 120.00, "K": 0.90, "I": 0.15},
-        "Percevejo Marrom": {"C": 150.00, "K": 0.85, "I": 0.80}
+        "*":                    {"C": 130.00, "K": 0.85, "I": 0.15},
+        "Lagarta-da-soja":      {"C": 120.00, "K": 0.90, "I": 0.15},
+        "Lagarta-do-cartucho":  {"C": 130.00, "K": 0.85, "I": 0.18},
+        "Percevejo-marrom":     {"C": 150.00, "K": 0.85, "I": 0.80}
     },
     "milho": {
-        "Cigarrinha do Milho": {"C": 140.00, "K": 0.80, "I": 1.20},
-        "Lagarta do Cartucho": {"C": 130.00, "K": 0.85, "I": 0.50}
+        "*":                    {"C": 140.00, "K": 0.82, "I": 0.60},
+        "Cigarrinha-do-milho":  {"C": 140.00, "K": 0.80, "I": 1.20},
+        "Lagarta-do-cartucho":  {"C": 130.00, "K": 0.85, "I": 0.50}
     },
     "algodao": {
-        "Bicudo do Algodoeiro": {"C": 200.00, "K": 0.85, "I": 2.50}
+        "*":                    {"C": 200.00, "K": 0.85, "I": 1.50},
+        "Bicudo-do-algodoeiro": {"C": 200.00, "K": 0.85, "I": 2.50},
+        "Lagarta-do-cartucho":  {"C": 180.00, "K": 0.85, "I": 1.10}
     }
 }
 
+# Fallback prices used only when market_prices is empty. Kept identical to
+# _bundledPrices in lib/services/mip_service.dart and to the seed in
+# supabase/migrations/03_mip_and_pest_map.sql - a different V here means the
+# app and the pipeline compute a different NDE for the same field.
 DEFAULT_PRICES = {
-    "soja": 135.50,
-    "milho": 58.20,
-    "algodao": 240.00
+    "soja": 129.71,
+    "milho": 65.32,
+    "algodao": 210.45
 }
 
 def fetch_market_prices():
@@ -68,7 +86,7 @@ def fetch_market_prices():
                     "culture": crop,
                     "price_per_sack": price,
                     "source": "CONAB",
-                    "updated_at": datetime.utcnow().isoformat()
+                    "updated_at": datetime.now(timezone.utc).isoformat()
                 }
                 
                 if existing.data:
@@ -120,7 +138,7 @@ def fetch_weather_snapshots():
                     "temperature": temp,
                     "humidity": hum,
                     "precipitation": prec,
-                    "captured_at": datetime.utcnow().isoformat()
+                    "captured_at": datetime.now(timezone.utc).isoformat()
                 }).execute()
                 print(f"Persisted weather snapshot: {muni} -> Temp: {temp}C, Hum: {hum}%")
             except Exception as db_err:
@@ -144,7 +162,12 @@ def run_calculations_and_rules():
     
     # 2. Fetch MIP Parameters from DB
     mip_res = supabase.table("mip_parameters").select("*").execute()
-    db_mip = {m["culture"]: m for m in mip_res.data} if mip_res.data else {}
+    # Keyed by (culture, pest_species) so the per-pest rows added in migration 03
+    # are actually reachable. The old dict was keyed by culture alone, so every
+    # pest in a crop silently shared one injury coefficient.
+    db_mip = {}
+    for m in (mip_res.data or []):
+        db_mip[(m["culture"], m.get("pest_species", "*"))] = m
 
     # 3. Fetch all fields
     fields_res = supabase.table("fields").select("*").execute()
@@ -162,7 +185,7 @@ def run_calculations_and_rules():
                 "field_id": field_id,
                 "score": 10,
                 "main_pest": "Nenhuma",
-                "updated_at": datetime.utcnow().isoformat()
+                "updated_at": datetime.now(timezone.utc).isoformat()
             }).execute()
             continue
             
@@ -170,20 +193,24 @@ def run_calculations_and_rules():
         pest_species = latest_sampling["species"]
         pest_count = latest_sampling["count"]
         
-        # Resolve C, K, I parameters
-        if crop_type in db_mip:
-            # Use real database variables
-            C = float(db_mip[crop_type]["control_cost_per_ha"])
-            K = float(db_mip[crop_type]["efficacy_factor"])
-            I = float(db_mip[crop_type]["injury_factor"])
+        # Resolve C, K, I. Most specific source wins: exact pest row from the
+        # database, then the '*' wildcard row for the crop, then the local
+        # fallback table. Kept in step with MipService.parametersFor() in Dart.
+        row = db_mip.get((crop_type, pest_species)) or db_mip.get((crop_type, "*"))
+        if row:
+            C = float(row["control_cost_per_ha"])
+            K = float(row["efficacy_factor"])
+            I = float(row["injury_factor"])
         else:
-            # Fallback to local config
             crop_params = MIP_FALLBACK_PARAMETERS.get(crop_type, {})
-            pest_params = crop_params.get(pest_species, {"C": 150.00, "K": 0.85, "I": 1.0})
+            pest_params = crop_params.get(
+                pest_species,
+                crop_params.get("*", {"C": 150.00, "K": 0.85, "I": 1.0}),
+            )
             C = pest_params["C"]
             K = pest_params["K"]
             I = pest_params["I"]
-            
+
         V = prices.get(crop_type, DEFAULT_PRICES.get(crop_type, 100.00))
         
         # Calculate Economic Injury Level (NDE)
@@ -196,15 +223,18 @@ def run_calculations_and_rules():
         if pest_count >= nde:
             score = 100
         else:
-            score = int((pest_count / nde) * 70)
-            score = min(max(score, 0), 99)
+            # Same linear scale as RiskCalculator.scoreFor in Dart. The old *70
+            # factor meant the pipeline could never emit a value between 71 and
+            # 99, so it disagreed with the app about the Yellow/Red boundary.
+            score = int(round((pest_count / nde) * 100))
+            score = min(max(score, 1), 99)
             
         # Update risk_scores table
         supabase.table("risk_scores").upsert({
             "field_id": field_id,
             "score": score,
             "main_pest": pest_species,
-            "updated_at": datetime.utcnow().isoformat()
+            "updated_at": datetime.now(timezone.utc).isoformat()
         }).execute()
         
         # Trigger mock WhatsApp alert if score is critical (RED/100)
@@ -213,46 +243,115 @@ def run_calculations_and_rules():
 
 def trigger_whatsapp_alert(field, pest, count, nde):
     """
-    Simulates sending a WhatsApp Alert when infestation is critical (RN 11 / RI 01).
+    Notifies the producer that their own field crossed the economic threshold.
+
+    Delivery is delegated to the notify-hotspot Edge Function so there is a single
+    place that talks to WhatsApp. This used to print() the message and log it,
+    which meant the pipeline claimed to alert without ever sending anything.
+
+    Falls back to printing when the function is not configured, so a local run
+    with no credentials still shows what would have gone out.
     """
     producer_id = field["producer_id"]
     profile_res = supabase.table("profiles").select("*").eq("id", producer_id).execute()
-    
+
     if not profile_res.data:
         return
-        
+
     profile = profile_res.data[0]
-    phone = profile.get("phone", "Não cadastrado")
-    name = profile.get("name", "Produtor")
-    
+    phone = profile.get("phone") or "Não cadastrado"
+    name = profile.get("name") or "Produtor"
+
     message = (
-        f"🚨 *ALERTA AGRO-ALERTA* 🚨\n\n"
+        f"*AGRO ALERTA GO*\n\n"
         f"Olá, {name}!\n"
-        f"Identificamos uma infestação crítica no seu talhão *{field['name']}*.\n"
-        f"A contagem de *{pest}* atingiu *{count}*, superando o Nível de Dano Econômico calculado de *{nde:.2f}*.\n\n"
-        f"💡 *Recomendação:* A aplicação química é financeiramente viável no momento. Consulte o seu extensionista associado."
+        f"A contagem de *{pest}* no seu talhão *{field['name']}* chegou a *{count}*, "
+        f"acima do ponto de prejuízo calculado ({nde:.0f}).\n\n"
+        f"*Recomendação:* a aplicação já se paga. Fale com seu extensionista."
     )
-    
-    print(f"\n--- WHATSAPP NOTIFICATION SENT ---")
-    print(f"To: {phone}")
-    print(f"Message:\n{message}")
-    print(f"----------------------------------\n")
-    
-    # Log sent alert in alert_logs table
+
+    sent = False
+    detail = "edge function não configurada"
+
+    if EDGE_FUNCTION_URL and CRON_SECRET:
+        try:
+            response = requests.post(
+                f"{EDGE_FUNCTION_URL}/notify-producer",
+                headers={
+                    "Content-Type": "application/json",
+                    "x-cron-secret": CRON_SECRET,
+                },
+                json={
+                    "profile_id": producer_id,
+                    "phone": phone,
+                    "name": name,
+                    "pest": pest,
+                    "field_name": field["name"],
+                    "count": count,
+                    "nde": round(nde, 2),
+                },
+                timeout=20,
+            )
+            sent = response.ok
+            detail = response.text[:500]
+        except Exception as err:
+            detail = str(err)
+
+    if not sent:
+        print("\n--- WHATSAPP (não enviado) ---")
+        print(f"Para: {phone}")
+        print(f"Motivo: {detail}")
+        print(f"Mensagem:\n{message}")
+        print("------------------------------\n")
+
+    # alert_logs is the audit trail: record the attempt either way, with the
+    # outcome, instead of logging every message as if it had been delivered.
     try:
         supabase.table("alert_logs").insert({
             "profile_id": producer_id,
             "pest_species": pest,
             "severity": "vermelho",
             "message": message,
-            "sent_at": datetime.utcnow().isoformat()
+            "hotspot_key": f"field:{field['id']}",
+            "channel": "whatsapp" if sent else "pipeline-dry-run",
+            "delivery_status": "sent" if sent else "failed",
+            "provider_response": detail[:1000],
+            "sent_at": datetime.now(timezone.utc).isoformat()
         }).execute()
     except Exception as e:
         print(f"Failed to log alert message: {e}")
+
+
+def notify_regional_hotspots():
+    """
+    Asks the notify-hotspot Edge Function to run the regional pass (RF06 + RN14).
+
+    The pipeline deliberately does not duplicate the clustering or the WhatsApp
+    call: both live in the function, which is also what the cron schedule hits.
+    """
+    if not (EDGE_FUNCTION_URL and CRON_SECRET):
+        print("Regional alerts skipped: SUPABASE_FUNCTIONS_URL/CRON_SECRET não definidos.")
+        return
+
+    try:
+        response = requests.post(
+            f"{EDGE_FUNCTION_URL}/notify-hotspot",
+            headers={
+                "Content-Type": "application/json",
+                "x-cron-secret": CRON_SECRET,
+            },
+            json={},
+            timeout=60,
+        )
+        print(f"Regional alerts: HTTP {response.status_code} -> {response.text[:800]}")
+    except Exception as err:
+        print(f"Regional alerts failed: {err}")
+
 
 if __name__ == "__main__":
     print("Starting Ingestion Pipeline...")
     fetch_market_prices()
     fetch_weather_snapshots()
     run_calculations_and_rules()
+    notify_regional_hotspots()
     print("Ingestion Pipeline execution finished.")
