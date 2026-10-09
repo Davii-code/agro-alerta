@@ -17,8 +17,16 @@ class DatabaseService {
   /// Hive schema migration on the producer's phone.
   late Box<String> _cacheBox;
 
-  Future<void> init() async {
-    await Hive.initFlutter();
+  /// [directory] exists for tests: Hive.initFlutter() resolves the app
+  /// documents path through path_provider, which has no implementation under
+  /// flutter_test. Passing a temp dir lets the storage layer be tested for
+  /// real instead of behind a mock that cannot catch a Hive-level mistake.
+  Future<void> init({String? directory}) async {
+    if (directory != null) {
+      Hive.init(directory);
+    } else {
+      await Hive.initFlutter();
+    }
 
     if (!Hive.isAdapterRegistered(0)) {
       Hive.registerAdapter(FieldModelAdapter());
@@ -66,6 +74,10 @@ class DatabaseService {
         _samplingBox.values.where((s) => s.fieldId == id).map((s) => s.id).toList();
     await _samplingBox.deleteAll(orphans);
     await _fieldBox.delete(id);
+    // A local delete alone does not stick: HomeScreen refreshes from
+    // `fields` on every load and would write the row straight back. Record the
+    // id so the refresh skips it and SyncService can delete it server-side.
+    await _recordDeletedField(id);
   }
 
   Future<void> clearFields() async => _fieldBox.clear();
@@ -100,8 +112,13 @@ class DatabaseService {
   List<SamplingModel> getUnsyncedSamplings() =>
       _samplingBox.values.where((s) => !s.isSynced).toList();
 
+  /// Drives the sync badge and the "nothing to send" short-circuit in
+  /// SyncService. Pending deletions count: a tombstone is queued work too, and
+  /// leaving it out meant triggerSync() returned early and never replayed it.
   int get pendingCount =>
-      getUnsyncedSamplings().length + getUnsyncedFields().length;
+      getUnsyncedSamplings().length +
+      getUnsyncedFields().length +
+      getDeletedFieldIds().length;
 
   Future<void> markSamplingSynced(String id) async {
     final sampling = _samplingBox.get(id);
@@ -135,9 +152,44 @@ class DatabaseService {
 
   Future<void> markOnboardingSeen() => _cacheBox.put('onboarding_done', 'true');
 
+  // --- DELETION QUEUE -------------------------------------------------------
+
+  /// Ids of fields deleted on the phone whose server row is still there.
+  ///
+  /// Deleting offline has to be remembered, not just applied: the next refresh
+  /// reads `fields` from Supabase, and without a tombstone the deleted field
+  /// comes back and the delete looks like it did nothing. Kept in the string
+  /// cache box as a comma-separated list - a handful of uuids until the next
+  /// successful sync, so a typed box would be overkill.
+  static const _deletedFieldsKey = 'deleted_field_ids';
+
+  Set<String> getDeletedFieldIds() {
+    final raw = _cacheBox.get(_deletedFieldsKey);
+    if (raw == null || raw.isEmpty) return const {};
+    return raw.split(',').where((e) => e.isNotEmpty).toSet();
+  }
+
+  Future<void> _recordDeletedField(String id) async {
+    final ids = getDeletedFieldIds().toSet()..add(id);
+    await _cacheBox.put(_deletedFieldsKey, ids.join(','));
+  }
+
+  /// Called once the server row is gone, so the tombstone stops being replayed.
+  Future<void> clearDeletedFieldId(String id) async {
+    final ids = getDeletedFieldIds().toSet()..remove(id);
+    if (ids.isEmpty) {
+      await _cacheBox.delete(_deletedFieldsKey);
+    } else {
+      await _cacheBox.put(_deletedFieldsKey, ids.join(','));
+    }
+  }
+
   /// Wipes producer data on sign-out while keeping reference data cached.
   Future<void> clearUserData() async {
     await _fieldBox.clear();
     await _samplingBox.clear();
+    // Tombstones belong to the account that created them. Leaving them behind
+    // would hide another producer's fields with a colliding id.
+    await _cacheBox.delete(_deletedFieldsKey);
   }
 }

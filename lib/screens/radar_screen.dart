@@ -256,10 +256,6 @@ class _RadarScreenState extends State<RadarScreen> {
               ),
           ],
         ),
-        // OSM's tile usage policy requires visible attribution.
-        const SimpleAttributionWidget(
-          source: Text('© OpenStreetMap'),
-        ),
       ],
     );
   }
@@ -493,6 +489,15 @@ class _RadarScreenState extends State<RadarScreen> {
             'O círculo cresce conforme mais produtores confirmam a mesma praga. '
             'Toque para ver os detalhes.',
             style: TextStyle(fontSize: 13, color: AgroTheme.textGray, height: 1.3),
+          ),
+          // A politica de uso dos tiles do OSM exige credito visivel. Fica aqui
+          // e nao sobreposto ao mapa: esta folha cobre o canto inferior, que e
+          // onde o widget de atribuicao do flutter_map se desenha por padrao,
+          // e o credito ficava escondido atras dela.
+          const SizedBox(height: 10),
+          const Text(
+            'Mapa © OpenStreetMap',
+            style: TextStyle(fontSize: 11, color: AgroTheme.textGray),
           ),
         ],
       ),

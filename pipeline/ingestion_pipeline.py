@@ -103,7 +103,7 @@ def fetch_market_prices():
     NDE without any visible error.
     """
     prices = DEFAULT_PRICES.copy()
-    sources = {crop: "fallback (bundled default)" for crop in prices}
+    sources = {crop: "valor de referência" for crop in prices}
 
     try:
         from agrobr.sync import cepea
@@ -124,7 +124,9 @@ def fetch_market_prices():
                     )
                     continue
                 prices[crop] = float(indicator.valor) * factor
-                sources[crop] = f"CEPEA/ESALQ ({unit} -> {CEPEA_TARGET_UNIT[crop]})"
+                # Short on purpose: HomeScreen prints this under the price in
+                # a chip, and a long string stretched the chip off screen.
+                sources[crop] = f"CEPEA/ESALQ · R$/{CEPEA_TARGET_UNIT[crop]}"
                 print(
                     f"CEPEA {crop}: {indicator.valor} {unit} "
                     f"-> R$ {prices[crop]:.2f}/{CEPEA_TARGET_UNIT[crop]} "

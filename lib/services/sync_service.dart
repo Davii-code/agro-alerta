@@ -138,6 +138,10 @@ class SyncService {
 
       await _db.pruneOrphanSamplings();
 
+      // Deletions first: replaying a tombstone after pushing would re-upload a
+      // field the producer just removed, and the row would survive the sync.
+      await _pushFieldDeletions(client);
+
       // Fields first: a sampling references field_id, so pushing a sampling
       // before its field violates samplings_field_id_fkey.
       await _pushFields(client);
@@ -153,6 +157,27 @@ class SyncService {
         status: SyncStatus.error,
         message: 'Não foi possível enviar agora. Vamos tentar de novo sozinho.',
       );
+    }
+  }
+
+  /// Applies the fields the producer deleted on the phone to the server.
+  ///
+  /// Each tombstone is cleared only after its delete returns, so a failed call
+  /// is retried on the next sync instead of leaving the row orphaned on the
+  /// server, where the next refresh would pull it back into the list.
+  Future<void> _pushFieldDeletions(SupabaseClient client) async {
+    final ids = _db.getDeletedFieldIds();
+    if (ids.isEmpty) return;
+
+    for (final id in ids) {
+      try {
+        await client.from('fields').delete().eq('id', id);
+        await _db.clearDeletedFieldId(id);
+      } catch (e) {
+        // A field that was never pushed has no server row; the delete is a
+        // no-op and the tombstone can go. Anything else stays queued.
+        debugPrint('SyncService: falha ao apagar o talhão $id no servidor ($e)');
+      }
     }
   }
 

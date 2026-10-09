@@ -47,8 +47,14 @@ class _HomeScreenState extends State<HomeScreen> {
       try {
         final response = await Supabase.instance.client.from('fields').select();
         if (response.isNotEmpty) {
-          final remote =
-              response.map<FieldModel>((f) => FieldModel.fromJson(f)).toList();
+          // Fields deleted on the phone whose server row has not been removed
+          // yet are dropped here. Without this the delete looked broken: the
+          // row came back on the very refresh that follows it.
+          final deleted = _db.getDeletedFieldIds();
+          final remote = response
+              .map<FieldModel>((f) => FieldModel.fromJson(f))
+              .where((f) => !deleted.contains(f.id))
+              .toList();
 
           // Locally created fields that have not been pushed yet must survive a
           // refresh; clearing the box outright used to delete them.
@@ -194,11 +200,21 @@ class _HomeScreenState extends State<HomeScreen> {
     if (confirm != true) return;
 
     await _db.deleteField(field.id);
+    // Push the deletion straight away when there is signal, so the row is gone
+    // server-side before any other device refreshes. Offline it stays queued as
+    // a tombstone and goes out on the next sync.
+    if (_isOnline) {
+      await SyncService().triggerSync();
+    }
     await _loadData();
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
-        content: Text('Talhão excluído.'),
+      SnackBar(
+        content: Text(
+          _db.getDeletedFieldIds().contains(field.id)
+              ? 'Talhão excluído. Vamos apagar no servidor quando houver sinal.'
+              : 'Talhão excluído.',
+        ),
         backgroundColor: AgroTheme.textDark,
       ),
     );
@@ -432,11 +448,18 @@ class _HomeScreenState extends State<HomeScreen> {
                     color: AgroTheme.textDark,
                   ),
                 ),
-                Text(
-                  '${p.source} · ${_shortDate(p.updatedAt)}',
-                  style: const TextStyle(
-                    fontSize: 12,
-                    color: AgroTheme.textGray,
+                // Bounded and ellipsised: the chip is sized by its text, and
+                // a long source string used to stretch it past the screen.
+                ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 220),
+                  child: Text(
+                    '${p.source} · ${_shortDate(p.updatedAt)}',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      fontSize: 12,
+                      color: AgroTheme.textGray,
+                    ),
                   ),
                 ),
               ],
