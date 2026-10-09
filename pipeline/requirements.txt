@@ -1,4 +1,9 @@
-supabase>=2.3.0
-requests>=2.31.0
-python-dotenv>=1.0.1
-agrobr>=0.1.0
+# Pinned exactly. agrobr 0.1.0 -> 1.1.0 renamed conab.safras(state=) to (uf=)
+# and the pipeline only found out in production, so no range here.
+supabase==2.32.0
+requests==2.34.2
+python-dotenv==1.2.4
+pandas==3.0.6
+# CEPEA/ESALQ data is CC BY-NC 4.0: non-commercial use only.
+# Commercial use needs written authorization (cepea@usp.br).
+agrobr==1.1.0

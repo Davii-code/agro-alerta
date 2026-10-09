@@ -1,7 +1,8 @@
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
-import 'package:google_maps_flutter/google_maps_flutter.dart';
+import 'package:flutter_map/flutter_map.dart';
+import 'package:latlong2/latlong.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import '../models/field_model.dart';
 import '../services/database_service.dart';
@@ -171,7 +172,7 @@ class _RadarScreenState extends State<RadarScreen> {
       body: Stack(
         children: [
           Positioned.fill(
-            child: _offlineMode ? _simplifiedMap() : _googleMap(),
+            child: _offlineMode ? _simplifiedMap() : _osmMap(),
           ),
           Positioned(top: 12, left: 12, right: 12, child: _topBanner()),
           Positioned(left: 0, right: 0, bottom: 0, child: _legendSheet()),
@@ -187,49 +188,119 @@ class _RadarScreenState extends State<RadarScreen> {
     );
   }
 
-  Widget _googleMap() {
-    return GoogleMap(
-      initialCameraPosition: CameraPosition(target: _initialTarget, zoom: 11),
-      myLocationEnabled: true,
-      myLocationButtonEnabled: true,
-      zoomControlsEnabled: false,
-      // Weighted circles instead of fixed-size pins: the halo grows with the
-      // number of independent confirmations, which is what "heat" means here.
-      circles: _hotspots
-          .map((h) => Circle(
-                circleId: CircleId('heat_${h.pest}_${h.latitude}_${h.longitude}'),
-                center: LatLng(h.latitude, h.longitude),
-                radius: h.intensityRadiusMeters,
-                fillColor: h.color.withValues(alpha: 0.18),
-                strokeColor: h.color.withValues(alpha: 0.55),
-                strokeWidth: 2,
-              ))
-          .toSet(),
-      markers: {
-        for (final h in _hotspots)
-          Marker(
-            markerId: MarkerId('${h.pest}_${h.latitude}_${h.longitude}'),
-            position: LatLng(h.latitude, h.longitude),
-            infoWindow: InfoWindow(
-              title: h.pest,
-              snippet:
-                  '${h.observerCount} produtores confirmaram · ${h.totalSpecimens} insetos',
-            ),
+  /// OpenStreetMap tiles through flutter_map.
+  ///
+  /// Google Maps needs a billed API key, and without one the SDK renders a grey
+  /// grid with no error - the map simply looks broken. OSM tiles need no key, so
+  /// the radar works on a fresh checkout. The tile server asks for a real
+  /// User-Agent and sets a fair-use limit, which `userAgentPackageName` covers
+  /// and this screen's traffic (one viewport per open) stays well inside.
+  Widget _osmMap() {
+    return FlutterMap(
+      options: MapOptions(
+        initialCenter: _initialTarget,
+        initialZoom: 11,
+        // OSM has no tiles past 19, and letting the user zoom further just
+        // shows blank squares.
+        maxZoom: 18,
+      ),
+      children: [
+        TileLayer(
+          urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+          userAgentPackageName: 'com.example.agro_alerta',
+          maxNativeZoom: 19,
+        ),
+        // Weighted circles instead of fixed-size pins: the halo grows with the
+        // number of independent confirmations, which is what "heat" means here.
+        CircleLayer(
+          circles: _hotspots
+              .map((h) => CircleMarker(
+                    point: LatLng(h.latitude, h.longitude),
+                    radius: h.intensityRadiusMeters,
+                    // Without this the radius would be read as screen pixels,
+                    // so a focus would cover the same area at every zoom.
+                    useRadiusInMeter: true,
+                    color: h.color.withValues(alpha: 0.18),
+                    borderColor: h.color.withValues(alpha: 0.55),
+                    borderStrokeWidth: 2,
+                  ))
+              .toList(),
+        ),
+        MarkerLayer(
+          markers: [
+            for (final h in _hotspots)
+              Marker(
+                point: LatLng(h.latitude, h.longitude),
+                width: 40,
+                height: 40,
+                child: _mapPin(
+                  icon: Icons.warning_rounded,
+                  color: h.color,
+                  title: h.pest,
+                  subtitle:
+                      '${h.observerCount} produtores confirmaram · ${h.totalSpecimens} insetos',
+                ),
+              ),
+            // The producer's own fields, so the focus has a reference point.
+            for (final f in _myFields)
+              Marker(
+                point: LatLng(f.latitude, f.longitude),
+                width: 40,
+                height: 40,
+                child: _mapPin(
+                  icon: Icons.agriculture_rounded,
+                  color: AgroTheme.statusGreen,
+                  title: f.name,
+                  subtitle: 'Seu talhão · ${f.cropType}',
+                ),
+              ),
+          ],
+        ),
+        // OSM's tile usage policy requires visible attribution.
+        const SimpleAttributionWidget(
+          source: Text('© OpenStreetMap'),
+        ),
+      ],
+    );
+  }
+
+  /// A tappable pin. flutter_map has no InfoWindow equivalent, so the label
+  /// that Google Maps drew on tap becomes a bottom sheet.
+  Widget _mapPin({
+    required IconData icon,
+    required Color color,
+    required String title,
+    required String subtitle,
+  }) {
+    return GestureDetector(
+      onTap: () => showModalBottomSheet<void>(
+        context: context,
+        showDragHandle: true,
+        builder: (_) => Padding(
+          padding: const EdgeInsets.fromLTRB(24, 0, 24, 32),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Icon(icon, color: color),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      title,
+                      style: Theme.of(context).textTheme.titleMedium,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              Text(subtitle, style: Theme.of(context).textTheme.bodyMedium),
+            ],
           ),
-        // The producer's own fields, so the focus has a reference point.
-        for (final f in _myFields)
-          Marker(
-            markerId: MarkerId('field_${f.id}'),
-            position: LatLng(f.latitude, f.longitude),
-            icon: BitmapDescriptor.defaultMarkerWithHue(
-              BitmapDescriptor.hueGreen,
-            ),
-            infoWindow: InfoWindow(
-              title: f.name,
-              snippet: 'Seu talhão · ${f.cropType}',
-            ),
-          ),
-      },
+        ),
+      ),
+      child: Icon(icon, color: color, size: 32),
     );
   }
 

@@ -33,16 +33,27 @@ Sem `--dart-define` o app sobe em modo offline: em build de debug aceita
 qualquer login para demonstração; em release recusa entrar, porque um usuário
 sem UUID real não consegue sincronizar (a RLS exige `auth.uid() = observer_id`).
 
-### Google Maps no Android
+### Mapa do radar
 
-A chave vai em `android/local.properties` (que já está no `.gitignore`):
+O radar usa `flutter_map` com tiles do OpenStreetMap, que não pedem chave nem
+conta de faturamento — o app compila e o mapa funciona num checkout limpo. A
+alternativa anterior era o Google Maps, que exige uma API key vinculada a um
+cartão; sem a chave o SDK renderiza uma grade cinza e não reporta erro nenhum,
+então a tela só parecia quebrada.
 
-```properties
-googleMaps.apiKey=AIza...
-```
+Duas obrigações vêm junto com os tiles públicos do OSM:
 
-O `build.gradle.kts` injeta esse valor no manifesto. Sem a chave o app compila
-normalmente e o radar usa o mapa vetorial simplificado.
+- O `TileLayer` manda `userAgentPackageName`, porque a política de uso do OSM
+  recusa requisições sem User-Agent identificável.
+- A atribuição `© OpenStreetMap` fica visível no canto do mapa, como a mesma
+  política exige.
+
+Volume de tráfego de app em campo cabe no uso gratuito. Se um dia passar do
+limite, troca-se só o `urlTemplate` por um provedor de tiles com plano pago
+(MapTiler, Thunderforest, Stadia) — o resto da tela não muda.
+
+O botão na barra de título continua alternando para o mapa vetorial
+simplificado, que é o fallback de quando não há rede.
 
 ### Permissões
 

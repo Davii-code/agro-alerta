@@ -1,4 +1,3 @@
-import java.util.Properties
 
 plugins {
     id("com.android.application")
@@ -7,14 +6,6 @@ plugins {
     id("dev.flutter.flutter-gradle-plugin")
 }
 
-// The Google Maps key lives in android/local.properties (git-ignored), never in the manifest.
-// Add a line `googleMaps.apiKey=AIza...` there. A build without it still compiles; the map
-// simply renders blank, which is why RadarScreen keeps its offline vector fallback.
-val localProperties = Properties().apply {
-    val file = rootProject.file("local.properties")
-    if (file.exists()) file.inputStream().use { load(it) }
-}
-val googleMapsApiKey: String = localProperties.getProperty("googleMaps.apiKey") ?: ""
 
 android {
     namespace = "com.example.agro_alerta"
@@ -39,8 +30,6 @@ android {
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
-
-        manifestPlaceholders["googleMapsApiKey"] = googleMapsApiKey
     }
 
     buildTypes {

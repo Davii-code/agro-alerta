@@ -1,6 +1,7 @@
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import pandas as pd
 import requests
 from dotenv import load_dotenv
 from supabase import create_client, Client
@@ -57,79 +58,186 @@ DEFAULT_PRICES = {
     "algodao": 210.45
 }
 
+# What each crop's number means once it lands in market_prices.price_per_sack.
+# Soja and milho are quoted per 60 kg sack, so the column name is literal.
+# Algodao has no sack: CEPEA quotes it in centavos de real per pound, and the
+# app's bundled 210.45 was a R$/arroba figure, so arroba is the target here.
+CEPEA_TARGET_UNIT = {
+    "soja": "sc60kg",
+    "milho": "sc60kg",
+    "algodao": "@15kg",
+}
+
+# Published CEPEA unit -> factor that converts it into CEPEA_TARGET_UNIT.
+# Verified against agrobr 1.1.0 live responses: soja and milho come as
+# "BRL/sc60kg", algodao as "cBRL/lb". A unit missing from here is refused by
+# fetch_market_prices rather than persisted, because the column carries no unit
+# of its own and a wrong one silently rescales every NDE in the app.
+CEPEA_UNIT_TO_SACK = {
+    "soja": {"BRL/sc60kg": 1.0},
+    "milho": {"BRL/sc60kg": 1.0},
+    # centavos/lb -> R$/@: /100, then 2.2046226 lb per kg, then 15 kg per arroba.
+    "algodao": {"cBRL/lb": 2.2046226 * 15 / 100},
+}
+
+# NASA POWER publishes a day's values a few days late, and fills the gap with
+# rows whose columns are all NaN. Asking only for today therefore returns a row
+# that looks present and is empty, which is how this pipeline ended up writing
+# 25.0 C / 70% for every municipality. Look back far enough to land on a day
+# that is actually filled in.
+NASA_LOOKBACK_DAYS = 10
+
 def fetch_market_prices():
     """
-    Fetch crop prices from CONAB using agrobr library.
-    Falls back to hardcoded default values if library or API fails.
+    Fetch crop prices from the CEPEA/ESALQ indicator via agrobr.
+
+    This used to call conab.safras(crop, state="GO") and read a "preco" column.
+    That was wrong twice over: the keyword is `uf`, not `state`, and safras()
+    returns area/producao/produtividade - CONAB publishes no price there. So the
+    call always raised and every crop silently fell back to DEFAULT_PRICES,
+    which meant the NDE in the app was computed from a constant.
+
+    CEPEA is the reference price series for these three crops. Only the units
+    listed in CEPEA_UNIT_TO_SACK are accepted; anything else keeps the fallback
+    instead of persisting a number in the wrong unit, which would move every
+    NDE without any visible error.
     """
     prices = DEFAULT_PRICES.copy()
+    sources = {crop: "fallback (bundled default)" for crop in prices}
+
     try:
-        from agrobr.sync import conab
-        print("Fetching prices via agrobr...")
-        for crop in prices.keys():
-            df = conab.safras(crop, state="GO")
-            if df is not None and not df.empty:
-                latest_price = df.iloc[0].get("preco", prices[crop])
-                prices[crop] = float(latest_price)
-                print(f"CONAB price for {crop}: R$ {prices[crop]:.2f}")
-    except Exception as e:
-        print(f"CONAB Ingestion fallback (using mock/default values) due to: {e}")
-    
+        from agrobr.sync import cepea
+    except Exception as import_err:
+        print(f"CEPEA unavailable, keeping bundled prices: {import_err}")
+        cepea = None
+
+    if cepea is not None:
+        for crop in prices:
+            try:
+                indicator = cepea.ultimo(crop)
+                unit = indicator.unidade
+                factor = CEPEA_UNIT_TO_SACK.get(crop, {}).get(unit)
+                if factor is None:
+                    print(
+                        f"CEPEA {crop}: unidade inesperada {unit!r}, "
+                        f"mantendo R$ {prices[crop]:.2f} do fallback."
+                    )
+                    continue
+                prices[crop] = float(indicator.valor) * factor
+                sources[crop] = f"CEPEA/ESALQ ({unit} -> {CEPEA_TARGET_UNIT[crop]})"
+                print(
+                    f"CEPEA {crop}: {indicator.valor} {unit} "
+                    f"-> R$ {prices[crop]:.2f}/{CEPEA_TARGET_UNIT[crop]} "
+                    f"({indicator.data}, {indicator.praca})"
+                )
+            except Exception as err:
+                print(f"CEPEA {crop} falhou ({type(err).__name__}: {err}), mantendo fallback.")
+
     # Save to Supabase market_prices table (Aligned with your schema)
     if supabase:
         for crop, price in prices.items():
             try:
                 # Select existing to decide insert or update
                 existing = supabase.table("market_prices").select("id").eq("culture", crop).execute()
-                
+
                 data = {
                     "culture": crop,
-                    "price_per_sack": price,
-                    "source": "CONAB",
+                    "price_per_sack": round(price, 2),
+                    # There is no unit column, so the unit rides along in source.
+                    # Without it a reader cannot tell R$/saca from R$/arroba.
+                    "source": sources[crop],
                     "updated_at": datetime.now(timezone.utc).isoformat()
                 }
-                
+
                 if existing.data:
                     record_id = existing.data[0]["id"]
                     supabase.table("market_prices").update(data).eq("id", record_id).execute()
                 else:
                     supabase.table("market_prices").insert(data).execute()
-                    
-                print(f"Persisted market price: {crop} -> R$ {price:.2f}")
+
+                print(f"Persisted market price: {crop} -> R$ {price:.2f} [{sources[crop]}]")
             except Exception as db_err:
                 print(f"Error persisting price to database: {db_err}")
-                
+
     return prices
+
+# Coordinates of the municipalities sampled every run.
+MUNICIPALITY_COORDS = {
+    "Anapolis": (-16.32, -48.95),
+    "Rio Verde": (-17.79, -50.92),
+    "Jatai": (-17.88, -51.72),
+    "Neropolis": (-16.40, -49.21),
+}
+
 
 def fetch_weather_snapshots():
     """
-    Fetch weather snapshots for major municipalities in Goiás using INMET/NASA Power via agrobr.
+    Fetch weather snapshots for major municipalities in Goiás via NASA POWER.
+
+    Two bugs used to make every municipality report an identical 25.0 C / 70%:
+    the columns were read as "temperature"/"humidity"/"precipitation" while
+    agrobr returns "temp_media"/"umidade_rel"/"precip_mm", so .get() handed back
+    the placeholder defaults; and the window was today-to-today, which NASA
+    POWER answers with an all-NaN row because its daily series runs a few days
+    behind. Both failures were silent - .get() has no way to say "missing".
+
+    A municipality with no usable day is now skipped rather than written with a
+    made-up number, so weather_snapshots only ever holds measured values.
     """
-    municipalities = ["Anapolis", "Rio Verde", "Jatai", "Neropolis"]
     weather_data = []
-    
-    for muni in municipalities:
-        temp, hum, prec = 25.0, 70.0, 5.0
+
+    try:
+        from agrobr.sync import nasa_power
+    except Exception as import_err:
+        print(f"NASA POWER unavailable, no weather snapshot written: {import_err}")
+        return weather_data
+
+    today = datetime.now(timezone.utc).date()
+    start = today - timedelta(days=NASA_LOOKBACK_DAYS)
+
+    for muni, (lat, lon) in MUNICIPALITY_COORDS.items():
         try:
-            from agrobr.sync import nasa_power
-            print(f"Fetching NASA Power weather for {muni} via agrobr...")
-            coords = {"Anapolis": (-16.32, -48.95), "Rio Verde": (-17.79, -50.92), "Jatai": (-17.88, -51.72), "Neropolis": (-16.40, -49.21)}
-            lat, lon = coords[muni]
-            df = nasa_power.clima_ponto(lat=lat, lon=lon, inicio=datetime.now().strftime("%Y-%m-%d"), fim=datetime.now().strftime("%Y-%m-%d"))
-            if df is not None and not df.empty:
-                temp = float(df.iloc[0].get("temperature", temp))
-                hum = float(df.iloc[0].get("humidity", hum))
-                prec = float(df.iloc[0].get("precipitation", prec))
+            print(f"Fetching NASA POWER weather for {muni} via agrobr...")
+            df = nasa_power.clima_ponto(
+                lat=lat,
+                lon=lon,
+                inicio=start.isoformat(),
+                fim=today.isoformat(),
+            )
+            if df is None or df.empty:
+                print(f"{muni}: NASA POWER returned no rows, skipping.")
+                continue
+
+            # Most recent day that carries both readings. dropna on the two
+            # required columns is what separates a real measurement from the
+            # NaN placeholder rows at the end of the series.
+            usable = df.dropna(subset=["temp_media", "umidade_rel"]).sort_values("data")
+            if usable.empty:
+                print(
+                    f"{muni}: nenhum dia preenchido nos ultimos "
+                    f"{NASA_LOOKBACK_DAYS} dias, pulando."
+                )
+                continue
+
+            row = usable.iloc[-1]
+            temp = float(row["temp_media"])
+            hum = float(row["umidade_rel"])
+            # Precipitation can legitimately be absent on a day that has
+            # temperature; a dry day is 0.0 mm, so that default is a fact.
+            prec_raw = row.get("precip_mm")
+            prec = 0.0 if prec_raw is None or pd.isna(prec_raw) else float(prec_raw)
+            captured_at = pd.Timestamp(row["data"]).tz_localize("UTC").isoformat()
         except Exception as e:
-            print(f"Weather Ingestion fallback for {muni} due to: {e}")
-            
+            print(f"Weather fetch failed for {muni} ({type(e).__name__}: {e}), skipping.")
+            continue
+
         weather_data.append({
             "municipality": muni,
             "temperature": temp,
             "humidity": hum,
-            "precipitation": prec
+            "precipitation": prec,
         })
-        
+
         # Save to database
         if supabase:
             try:
@@ -138,9 +246,15 @@ def fetch_weather_snapshots():
                     "temperature": temp,
                     "humidity": hum,
                     "precipitation": prec,
-                    "captured_at": datetime.now(timezone.utc).isoformat()
+                    # The day the measurement refers to, not the run time: the
+                    # series lags, and a row stamped "now" would misdate it.
+                    "captured_at": captured_at,
                 }).execute()
-                print(f"Persisted weather snapshot: {muni} -> Temp: {temp}C, Hum: {hum}%")
+                print(
+                    f"Persisted weather snapshot: {muni} -> "
+                    f"{row['data'].date()} Temp: {temp:.1f}C, Hum: {hum:.1f}%, "
+                    f"Prec: {prec:.1f}mm"
+                )
             except Exception as db_err:
                 print(f"Error persisting weather to database: {db_err}")
 

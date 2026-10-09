@@ -15,12 +15,6 @@
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
 
-        <!-- Injected from android/local.properties via manifestPlaceholders (see build.gradle.kts).
-             Never commit the real key: local.properties is git-ignored. -->
-        <meta-data
-            android:name="com.google.android.geo.API_KEY"
-            android:value="${googleMapsApiKey}"/>
-
         <activity
             android:name=".MainActivity"
             android:exported="true"
