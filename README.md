@@ -84,6 +84,27 @@ cp .env.example .env   # preencha
 python ingestion_pipeline.py
 ```
 
+### Execução automática (GitHub Actions)
+
+`.github/workflows/supabase-keepalive.yml` roda todos os dias às 11:17 UTC
+(08:17 em Brasília) e também pode ser disparado à mão em Actions →
+*Supabase keepalive* → *Run workflow*. O job `heartbeat` grava uma linha em
+`public.keepalive`; o job `ingestion` executa `pipeline/ingestion_pipeline.py`
+em seguida. A escrita diária é o que impede o Supabase de pausar o projeto por
+inatividade no plano free.
+
+Secrets necessários em *Settings → Secrets and variables → Actions*:
+
+| Secret | Obrigatório | Para quê |
+|---|---|---|
+| `SUPABASE_URL` | sim | `https://<ref>.supabase.co` |
+| `SUPABASE_SERVICE_ROLE_KEY` | sim | escreve ignorando RLS |
+| `SUPABASE_FUNCTIONS_URL` | não | alertas regionais via Edge Function |
+| `CRON_SECRET` | não | mesmo valor do segredo da Edge Function |
+
+Sem os dois primeiros o workflow falha de propósito, em vez de passar sem
+escrever nada. Aplique a migration `04_keepalive.sql` antes do primeiro run.
+
 ## Requisitos implementados
 
 | Requisito | Onde |

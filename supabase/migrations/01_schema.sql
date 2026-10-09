@@ -143,28 +143,41 @@ ALTER TABLE public.risk_scores ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.alert_logs ENABLE ROW LEVEL SECURITY;
 
 -- RLS Policies
+DROP POLICY IF EXISTS "Profiles are viewable by everyone" ON public.profiles;
 CREATE POLICY "Profiles are viewable by everyone" ON public.profiles FOR SELECT USING (true);
+DROP POLICY IF EXISTS "Users can update their own profile" ON public.profiles;
 CREATE POLICY "Users can update their own profile" ON public.profiles FOR UPDATE USING (auth.uid() = id);
 
+DROP POLICY IF EXISTS "Users can view their own fields" ON public.fields;
 CREATE POLICY "Users can view their own fields" ON public.fields FOR SELECT USING (auth.uid() = producer_id);
+DROP POLICY IF EXISTS "Users can insert their own fields" ON public.fields;
 CREATE POLICY "Users can insert their own fields" ON public.fields FOR INSERT WITH CHECK (auth.uid() = producer_id);
+DROP POLICY IF EXISTS "Users can update their own fields" ON public.fields;
 CREATE POLICY "Users can update their own fields" ON public.fields FOR UPDATE USING (auth.uid() = producer_id);
+DROP POLICY IF EXISTS "Users can delete their own fields" ON public.fields;
 CREATE POLICY "Users can delete their own fields" ON public.fields FOR DELETE USING (auth.uid() = producer_id);
 
+DROP POLICY IF EXISTS "Samplings are viewable by everyone" ON public.samplings;
 CREATE POLICY "Samplings are viewable by everyone" ON public.samplings FOR SELECT USING (true);
+DROP POLICY IF EXISTS "Users can insert their own samplings" ON public.samplings;
 CREATE POLICY "Users can insert their own samplings" ON public.samplings FOR INSERT WITH CHECK (auth.uid() = observer_id);
+DROP POLICY IF EXISTS "Users can update/delete their own samplings" ON public.samplings;
 CREATE POLICY "Users can update/delete their own samplings" ON public.samplings FOR UPDATE USING (auth.uid() = observer_id);
 
+DROP POLICY IF EXISTS "Users can view risk scores for their fields" ON public.risk_scores;
 CREATE POLICY "Users can view risk scores for their fields" ON public.risk_scores FOR SELECT USING (
     EXISTS (SELECT 1 FROM public.fields WHERE fields.id = risk_scores.field_id AND fields.producer_id = auth.uid())
 );
 
+DROP POLICY IF EXISTS "Users can view their own alert logs" ON public.alert_logs;
 CREATE POLICY "Users can view their own alert logs" ON public.alert_logs FOR SELECT USING (auth.uid() = profile_id);
 
 -- --- RPC Functions for Edge Function ---
 
 -- Function: get_regional_hotspots
 -- Finds locations where at least `min_observers` have reported a pest focus within a `radius_meters` distance
+-- The remote may hold an older shape; CREATE OR REPLACE cannot change a return type.
+DROP FUNCTION IF EXISTS public.get_regional_hotspots(double precision, integer);
 CREATE OR REPLACE FUNCTION public.get_regional_hotspots(radius_meters double precision, min_observers integer)
 RETURNS TABLE (
   location geography(POINT, 4326),
@@ -187,6 +200,7 @@ $$ LANGUAGE plpgsql;
 
 -- Function: get_users_in_radius
 -- Finds producers that own fields of crop `p_culture` within `radius_meters` of a center coordinate
+DROP FUNCTION IF EXISTS public.get_users_in_radius(geography, double precision, text);
 CREATE OR REPLACE FUNCTION public.get_users_in_radius(
   center_loc geography(POINT, 4326),
   radius_meters double precision,
